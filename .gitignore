@@ -2,7 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
+venv/
 
 # Output files
-*.json
-*.csv
+rosemont_results.json
+rosemont_units.csv
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment
+.env
