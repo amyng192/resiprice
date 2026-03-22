@@ -17,7 +17,7 @@ export default function LoadingState({ slots }: Props) {
           <div className="loading-info">
             <div className="loading-url">{slot.url}</div>
             <div className="loading-status">
-              {slot.status === "scraping" && "Scraping... this may take up to 60 seconds"}
+              {slot.status === "scraping" && "Scraping... this may take up to 90 seconds"}
               {slot.status === "done" &&
                 `${slot.property!.name} — ${slot.property!.available_count} units found`}
               {slot.status === "error" && slot.error}

@@ -255,6 +255,7 @@ class PlaywrightScraper:
         ".apt-card",
         ".fp-row",
         ".floor-plan-card",
+        ".floorplan-listing__item",
         ".floorplan-listing",
         ".availableFloorplan",
         "[data-unit]",
@@ -267,12 +268,18 @@ class PlaywrightScraper:
         # Entrata
         ".unit-result",
         ".available-unit",
+        # MAA
+        ".floorplan-detail",
+        ".floor-plan-item",
+        "[class*='floorplan-listing'] [class*='item']",
+        # Cortland
+        ".floorplan-listing__item-details",
         # Generic table rows with unit info
         "table.units tbody tr",
         ".pricing-table tbody tr",
     ]
 
-    def __init__(self, headless: bool = True, timeout_ms: int = 45000):
+    def __init__(self, headless: bool = True, timeout_ms: int = 30000):
         self.headless = headless
         self.timeout_ms = timeout_ms
 
@@ -313,21 +320,22 @@ class PlaywrightScraper:
 
             def capture_response(response):
                 ct = response.headers.get("content-type", "")
-                if "json" in ct or "javascript" in ct:
+                if "json" in ct:
                     req_url = response.url.lower()
                     keywords = [
                         "unit", "apartment", "availability", "floorplan",
-                        "floor-plan", "pricing", "inventory", "getapartment",
-                        "sightmap",
+                        "floor-plan", "floor_plan", "pricing", "inventory",
+                        "getapartment", "sightmap",
                     ]
                     if any(kw in req_url for kw in keywords):
                         try:
                             body = response.text()
-                            api_responses.append({
-                                "url": response.url,
-                                "body": body,
-                            })
-                            log.debug(f"Captured API response: {response.url[:100]}")
+                            if len(body) > 50:
+                                api_responses.append({
+                                    "url": response.url,
+                                    "body": body,
+                                })
+                                log.debug(f"Captured API response: {response.url[:100]}")
                         except Exception:
                             pass
 
@@ -336,8 +344,15 @@ class PlaywrightScraper:
             try:
                 # ── Load the page ────────────────────────────────────────
                 log.info("Loading page...")
-                page.goto(url, wait_until="networkidle", timeout=self.timeout_ms)
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=self.timeout_ms)
+                except Exception:
+                    log.warning("networkidle timed out — retrying with domcontentloaded")
+                    page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 page.wait_for_timeout(3000)
+
+                # ── Dismiss overlays / cookie banners / popups ─────────
+                self._dismiss_overlays(page)
 
                 # ── Extract property-level info ──────────────────────────
                 prop = self._extract_property_info(page, url)
@@ -349,11 +364,10 @@ class PlaywrightScraper:
                 html_snapshots = []
 
                 if tab_labels:
-                    # User provided explicit tab labels
                     log.info(f"Using explicit tabs: {tab_labels}")
                     html_snapshots = self._click_explicit_tabs(page, tab_labels)
-                else:
-                    # Auto-detect tabs
+
+                if not html_snapshots:
                     tabs = self._detect_tabs(page, tab_type)
                     if tabs:
                         log.info(f"Detected {len(tabs)} tabs")
@@ -386,28 +400,10 @@ class PlaywrightScraper:
                 browser.close()
 
         # ── Parse all collected HTML + API responses ─────────────────────
-        all_units = []
+        all_units = self._parse_all_api_responses(api_responses)
         seen_unit_ids = set()
-
-        # Parse SightMap API responses first (highest fidelity)
-        for resp in api_responses:
-            if "sightmap" in resp["url"].lower():
-                units = self._parse_sightmap_response(resp["body"])
-                for u in units:
-                    uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
-                    if uid not in seen_unit_ids:
-                        seen_unit_ids.add(uid)
-                        all_units.append(u)
-
-        # Parse other API/XHR JSON responses (most structured)
-        for resp in api_responses:
-            if "sightmap" not in resp["url"].lower():
-                units = self._parse_api_response(resp["body"])
-                for u in units:
-                    uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
-                    if uid not in seen_unit_ids:
-                        seen_unit_ids.add(uid)
-                        all_units.append(u)
+        for u in all_units:
+            seen_unit_ids.add(f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}")
 
         # Parse HTML snapshots
         for snapshot in html_snapshots:
@@ -433,24 +429,68 @@ class PlaywrightScraper:
 
     # ── Property-level info ──────────────────────────────────────────────
 
+    @staticmethod
+    def _best_name_from_title(raw: str) -> str:
+        """Pick the most likely community name from a page/og title.
+
+        Titles often look like:
+          "Floor Plans | Rosemont Berkeley Lake"
+          "Montrose Berkeley Lake - Apartments in ..."
+          "Rosemont Grayson"
+          "MAA Berkeley Lake luxury apartments bring exquisite amenities..."
+        We split on common delimiters and pick the segment that is NOT a
+        generic page-section label (Floor Plans, Pricing, etc.).
+        """
+        generic = {
+            "floor plans", "floorplans", "pricing", "availability",
+            "apartments", "apartment", "home", "welcome",
+        }
+        # Split on | and – / — / - delimiters
+        parts = [s.strip() for s in raw.replace("–", "|").replace("—", "|").replace(" - ", "|").split("|") if s.strip()]
+        # Prefer the first non-generic part
+        for part in parts:
+            if part.lower() not in generic:
+                # If the part is very long (likely a description), take first few words
+                words = part.split()
+                if len(words) > 6:
+                    # Try to find a natural break point
+                    for i, w in enumerate(words):
+                        if w.lower() in ("luxury", "apartments", "apartment", "brings",
+                                         "bring", "featuring", "offers", "located", "is"):
+                            if i >= 2:
+                                return " ".join(words[:i])
+                    return " ".join(words[:4])
+                return part
+        # All parts are generic — return full title cleaned up
+        return parts[0] if parts else raw.strip()
+
     def _extract_property_info(self, page, url) -> Property:
         """Pull property name, address, specials from the page."""
         prop = Property(name="Unknown Property", website_url=url)
 
-        # Try meta tags first
+        # Try og:site_name first (usually the cleanest community name)
         try:
-            og_title = page.locator("meta[property='og:title']").get_attribute("content")
-            if og_title:
-                prop.name = og_title.split("|")[0].split("-")[0].strip()
+            og_site = page.locator("meta[property='og:site_name']").get_attribute("content")
+            if og_site and len(og_site) < 80:
+                prop.name = og_site.strip()
         except Exception:
             pass
+
+        # Try og:title
+        if prop.name == "Unknown Property":
+            try:
+                og_title = page.locator("meta[property='og:title']").get_attribute("content")
+                if og_title:
+                    prop.name = self._best_name_from_title(og_title)
+            except Exception:
+                pass
 
         # Fallback to page title
         if prop.name == "Unknown Property":
             try:
                 title = page.title()
                 if title:
-                    prop.name = title.split("|")[0].split("-")[0].strip()
+                    prop.name = self._best_name_from_title(title)
             except Exception:
                 pass
 
@@ -494,6 +534,23 @@ class PlaywrightScraper:
 
     # ── Tab Detection & Clicking ─────────────────────────────────────────
 
+    # Words that indicate a navigation menu item, not a floor/filter tab
+    NAV_KEYWORDS = {
+        "view", "details", "apply", "contact", "schedule", "tour",
+        "learn more", "see more", "read more",
+        "home", "amenities", "amenity", "neighborhood", "gallery",
+        "residents", "resident", "about", "photos", "map",
+        "virtual tour", "reviews", "faq", "blog", "news",
+        "login", "sign in", "portal", "pay rent",
+    }
+
+    def _is_nav_text(self, text: str) -> bool:
+        """Check if text looks like a navigation menu item rather than a tab."""
+        if not text:
+            return True
+        lower = text.lower().strip()
+        return lower in self.NAV_KEYWORDS or any(kw in lower for kw in self.NAV_KEYWORDS)
+
     def _detect_tabs(self, page, tab_type: str) -> list[dict]:
         """Find clickable tab/filter elements on the page."""
         tabs = []
@@ -506,6 +563,8 @@ class PlaywrightScraper:
                         try:
                             if el.is_visible():
                                 text = el.inner_text().strip()
+                                if self._is_nav_text(text):
+                                    continue
                                 tabs.append({
                                     "element": el,
                                     "text": text,
@@ -534,16 +593,19 @@ class PlaywrightScraper:
                     if len(buttons) >= 2:
                         for btn in buttons:
                             try:
-                                if btn.is_visible():
+                                if btn.is_visible(timeout=500):
+                                    text = btn.inner_text(timeout=500).strip()
+                                    if self._is_nav_text(text):
+                                        continue
                                     tabs.append({
                                         "element": btn,
-                                        "text": btn.inner_text().strip(),
+                                        "text": text,
                                         "selector": container_sel,
                                     })
                             except Exception:
                                 continue
                         if tabs:
-                            log.info(f"Found tabs in container '{container_sel}': "
+                            log.info(f"Found tabs via '{container_sel}': "
                                      f"{[t['text'] for t in tabs]}")
                             return tabs
         except Exception:
@@ -557,13 +619,13 @@ class PlaywrightScraper:
         for i, tab in enumerate(tabs):
             try:
                 log.info(f"  Clicking tab {i+1}/{len(tabs)}: \"{tab['text']}\"")
-                tab["element"].click()
+                tab["element"].click(timeout=5000)
                 page.wait_for_timeout(2000)
                 # Wait for any loading spinners to disappear
                 try:
                     page.wait_for_selector(
                         ".loading, .spinner, [class*='loading']",
-                        state="hidden", timeout=5000,
+                        state="hidden", timeout=3000,
                     )
                 except Exception:
                     pass
@@ -573,41 +635,55 @@ class PlaywrightScraper:
                 log.warning(f"  Failed to click tab \"{tab['text']}\": {e}")
         return snapshots
 
+    @staticmethod
+    def _tab_text_matches(el_text: str, label: str) -> bool:
+        """Strict tab text matching — avoid false positives like '1' matching '1344 Sq. Ft.'."""
+        if el_text == label:
+            return True
+        # Allow patterns like "1 (5 units)" or "Floor 3" but NOT "100 Bradford" or "1 Bed from..."
+        # The label must appear as a standalone token
+        return bool(re.match(
+            rf"^{re.escape(label)}(?:\s*\(.*\))?$",
+            el_text,
+        ))
+
     def _click_explicit_tabs(self, page, tab_labels: list[str]) -> list[str]:
         """
         Click tabs by matching their visible text to the provided labels.
-        Falls back to clicking by index if text matching fails.
+        Uses targeted selectors to avoid scanning the entire DOM.
         """
         snapshots = []
+        # Narrow search to likely tab containers — skip broad fallback
+        tab_selectors = [
+            "[role='tablist'] button, [role='tablist'] a, [role='tablist'] [role='tab']",
+            "[class*='tab'] button, [class*='tab'] a",
+            "[class*='floor'] button, [class*='floor'] a",
+            "[class*='filter'] button, [class*='filter'] a",
+        ]
+
         for label in tab_labels:
             clicked = False
             label_clean = label.strip()
 
-            # Strategy 1: find by exact or partial text match
-            for tag in ["button", "a", "[role='tab']", "li", "span", "div"]:
+            for sel in tab_selectors:
                 try:
-                    candidates = page.locator(tag).all()
+                    candidates = page.locator(sel).all()
                     for el in candidates:
                         try:
-                            if not el.is_visible():
+                            if not el.is_visible(timeout=500):
                                 continue
-                            el_text = el.inner_text().strip()
-                            # Match: exact text, starts with label, or contains
-                            # "(X units)" style text with the floor number
-                            if (el_text == label_clean or
-                                el_text.startswith(label_clean) or
-                                re.match(rf"^{re.escape(label_clean)}\b", el_text)):
+                            el_text = el.inner_text(timeout=500).strip()
+                            if self._tab_text_matches(el_text, label_clean):
                                 log.info(f"  Clicking tab: \"{el_text}\"")
                                 el.click()
-                                page.wait_for_timeout(2500)
+                                page.wait_for_timeout(2000)
                                 try:
                                     page.wait_for_selector(
                                         ".loading, .spinner",
-                                        state="hidden", timeout=5000,
+                                        state="hidden", timeout=3000,
                                     )
                                 except Exception:
                                     pass
-                                page.wait_for_timeout(1000)
                                 snapshots.append(page.content())
                                 clicked = True
                                 break
@@ -619,9 +695,44 @@ class PlaywrightScraper:
                     continue
 
             if not clicked:
-                log.warning(f"  Could not find tab with label \"{label_clean}\"")
+                log.debug(f"  Could not find tab with label \"{label_clean}\"")
 
         return snapshots
+
+    def _dismiss_overlays(self, page):
+        """Close cookie banners, popups, and overlays that block clicks."""
+        dismiss_selectors = [
+            # Cookie / consent banners
+            "#onetrust-accept-btn-handler",
+            "[id*='cookie'] button",
+            "[class*='cookie'] button",
+            "button[class*='accept']",
+            # Generic close / dismiss buttons on overlays
+            "[class*='overlay'] [class*='close']",
+            "[class*='modal'] [class*='close']",
+            "[class*='popup'] [class*='close']",
+            "[class*='hours'] [class*='close']",
+            # Property hours overlay (Cortland)
+            ".property-hours__overlay",
+        ]
+        for sel in dismiss_selectors:
+            try:
+                el = page.locator(sel).first
+                if el and el.is_visible(timeout=500):
+                    el.click(timeout=2000)
+                    log.info(f"  Dismissed overlay: {sel}")
+                    page.wait_for_timeout(500)
+            except Exception:
+                continue
+        # Also try to remove blocking overlays via JS if they can't be clicked
+        page.evaluate("""
+            () => {
+                for (const sel of ['.property-hours', '#onetrust-consent-sdk', '[class*="overlay"]']) {
+                    const el = document.querySelector(sel);
+                    if (el) el.style.display = 'none';
+                }
+            }
+        """)
 
     def _click_load_more(self, page):
         """Repeatedly click Load More / View All until no more appear."""
@@ -930,32 +1041,43 @@ class PlaywrightScraper:
 
         unit_num = str(get("UnitId", "ApartmentId", "unitId", "unit_number",
                            "apartmentName", "UnitNumber", "unitNumber",
+                           "unit_id", "name", "unit", "id",
                            default="N/A"))
         fp_name = get("FloorplanName", "floorPlanName", "planName",
-                       "floor_plan_name", "FloorPlan")
+                       "floor_plan_name", "FloorPlan", "floorplan_name",
+                       "floorPlan", "layout", "layoutName", "floor_plan",
+                       "floorplanName")
 
-        beds_raw = get("Beds", "beds", "bedrooms", "NumberOfBedrooms", "Bedrooms")
+        beds_raw = get("Beds", "beds", "bedrooms", "NumberOfBedrooms", "Bedrooms",
+                        "bedroom_count", "bedroomCount", "bed_count", "numBeds")
         beds = int(beds_raw) if beds_raw is not None else None
 
-        baths_raw = get("Baths", "baths", "bathrooms", "NumberOfBathrooms", "Bathrooms")
+        baths_raw = get("Baths", "baths", "bathrooms", "NumberOfBathrooms", "Bathrooms",
+                         "bathroom_count", "bathroomCount", "bath_count", "numBaths")
         baths = float(baths_raw) if baths_raw is not None else None
 
         sqft_raw = get("SquareFeet", "sqft", "squareFeet", "MaximumSquareFeet",
-                        "MinimumSquareFeet", "area", "SqFt", "SQFT")
+                        "MinimumSquareFeet", "area", "SqFt", "SQFT",
+                        "square_feet", "squareFt", "size", "maxSqft", "minSqft")
         sqft = int(float(str(sqft_raw).replace(",", ""))) if sqft_raw else None
 
         rent_raw = get("MinimumRent", "Rent", "rent", "price", "MonthlyRent",
-                        "minimumRent", "Price", "BaseRent")
+                        "minimumRent", "Price", "BaseRent",
+                        "effectiveRent", "marketRent", "min_price", "startingPrice",
+                        "monthly_rent", "rentAmount")
         rent_min = float(str(rent_raw).replace(",", "").replace("$", "")) if rent_raw else None
 
-        rent_max_raw = get("MaximumRent", "maximumRent", "maxRent", "MaxRent")
+        rent_max_raw = get("MaximumRent", "maximumRent", "maxRent", "MaxRent",
+                            "max_price", "maxPrice")
         rent_max = float(str(rent_max_raw).replace(",", "").replace("$", "")) if rent_max_raw else rent_min
 
         avail_raw = str(get("AvailableDate", "availableDate", "MoveInDate",
-                             "available_date", "DateAvailable", default=""))
+                             "available_date", "DateAvailable", "moveInDate",
+                             "move_in_date", "availableOn", "available_on",
+                             default=""))
         avail_date, status = parse_availability(avail_raw)
 
-        floor_raw = get("Floor", "floor", "FloorNumber")
+        floor_raw = get("Floor", "floor", "FloorNumber", "floorNumber")
         floor = int(floor_raw) if floor_raw is not None else None
 
         return Unit(
@@ -974,6 +1096,31 @@ class PlaywrightScraper:
 
     # ── API/XHR Response Parsing ─────────────────────────────────────────
 
+    def _parse_all_api_responses(self, api_responses: list[dict]) -> list["Unit"]:
+        """Parse all captured API responses, deduplicating units."""
+        all_units = []
+        seen = set()
+
+        # SightMap first (highest fidelity)
+        for resp in api_responses:
+            if "sightmap" in resp["url"].lower():
+                for u in self._parse_sightmap_response(resp["body"]):
+                    uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
+                    if uid not in seen:
+                        seen.add(uid)
+                        all_units.append(u)
+
+        # Then other API responses
+        for resp in api_responses:
+            if "sightmap" not in resp["url"].lower():
+                for u in self._parse_api_response(resp["body"]):
+                    uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
+                    if uid not in seen:
+                        seen.add(uid)
+                        all_units.append(u)
+
+        return all_units
+
     def _parse_api_response(self, body: str) -> list[Unit]:
         """Parse intercepted XHR/API responses for unit data."""
         units = []
@@ -989,8 +1136,11 @@ class PlaywrightScraper:
                 if u:
                     units.append(u)
         elif isinstance(data, dict):
+            # Check common top-level keys
             for key in ["units", "apartments", "availableUnits", "results",
-                         "floorPlanUnits", "data", "items"]:
+                         "floorPlanUnits", "data", "items", "floorplans",
+                         "floor_plans", "floorPlans", "listings", "availability",
+                         "availabilities", "propertyUnits"]:
                 if key in data and isinstance(data[key], list):
                     for item in data[key]:
                         u = self._parse_js_unit(item)
@@ -998,14 +1148,21 @@ class PlaywrightScraper:
                             units.append(u)
                     if units:
                         break
-            # Also check nested structures
+            # Check nested structures (2 levels deep)
             if not units:
                 for key, val in data.items():
-                    if isinstance(val, dict) and "units" in val:
-                        for item in val["units"]:
-                            u = self._parse_js_unit(item)
-                            if u:
-                                units.append(u)
+                    if isinstance(val, dict):
+                        for inner_key in ["units", "apartments", "floorplans",
+                                          "floor_plans", "availableUnits", "results"]:
+                            if inner_key in val and isinstance(val[inner_key], list):
+                                for item in val[inner_key]:
+                                    u = self._parse_js_unit(item)
+                                    if u:
+                                        units.append(u)
+                                if units:
+                                    break
+                    if units:
+                        break
 
         if units:
             log.info(f"  Parsed {len(units)} units from API response")

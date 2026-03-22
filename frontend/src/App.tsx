@@ -1,11 +1,15 @@
 import { useState, useCallback } from "react";
 import { fetchEventSource } from "@microsoft/fetch-event-source";
+import { useNavigate } from "react-router-dom";
 import { Property, PropertySlot } from "./types";
+import { useAuth } from "./hooks/useAuth";
 import UrlForm from "./components/UrlForm";
 import LoadingState from "./components/LoadingState";
 import ComparisonTable from "./components/ComparisonTable";
 
 export default function App() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
   const [slots, setSlots] = useState<PropertySlot[]>([]);
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<Property[]>([]);
@@ -64,8 +68,22 @@ export default function App() {
 
   return (
     <div className="app">
-      <header>
-        <h1>ResiPrice</h1>
+      <header className="app-header">
+        <div className="app-header-top">
+          <h1>ResiPrice</h1>
+          <div className="app-header-user">
+            <span className="app-username">{user?.username}</span>
+            <button
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                logout();
+                navigate("/");
+              }}
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
         <p>Compare apartment pricing across communities in real time.</p>
       </header>
 

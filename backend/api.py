@@ -22,12 +22,9 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 def scrape_one(url: str) -> dict:
     scraper = PlaywrightScraper(headless=True)
-    # Try with common floor tab labels first — most Entrata/property sites
-    # use numbered floor tabs. Without these, the scraper picks up nav menus.
+    # Single scrape — try explicit floor tabs first, auto-detect as fallback
+    # (both strategies run inside a single browser session now)
     result = scraper.scrape(url, tab_labels=["0", "1", "2", "3", "4", "5"], tab_type="floor")
-    if not result.units:
-        # Fallback: try auto-detect if floor tabs found nothing
-        result = scraper.scrape(url)
     return result.to_dict()
 
 
@@ -41,23 +38,44 @@ async def scrape(request: ScrapeRequest):
     urls = request.urls
     loop = asyncio.get_event_loop()
 
+    # Per-URL timeout: 90 seconds max so the frontend never spins forever
+    per_url_timeout = 90
+
     futures = {
         i: loop.run_in_executor(executor, scrape_one, url)
         for i, url in enumerate(urls)
     }
 
     async def event_generator():
-        pending = set(futures.values())
-        index_by_future = {f: i for i, f in futures.items()}
+        pending = {asyncio.ensure_future(f): i for f, i in
+                   {futures[i]: i for i in futures}.items()}
 
         while pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
+            done, still_pending = await asyncio.wait(
+                pending.keys(), return_when=asyncio.FIRST_COMPLETED,
+                timeout=per_url_timeout,
             )
-            for future in done:
-                idx = index_by_future[future]
+
+            # If nothing completed within the timeout, cancel remaining
+            if not done:
+                for task in still_pending:
+                    idx = pending[task]
+                    task.cancel()
+                    log.error(f"Scrape timed out for {urls[idx]}")
+                    yield {
+                        "event": "error",
+                        "data": json.dumps({
+                            "index": idx,
+                            "url": urls[idx],
+                            "error": "Scrape timed out — this site may be too complex to scrape automatically.",
+                        }),
+                    }
+                break
+
+            for task in done:
+                idx = pending.pop(task)
                 try:
-                    result = future.result()
+                    result = task.result()
                     yield {
                         "event": "property",
                         "data": json.dumps({
