@@ -181,6 +181,48 @@ def parse_availability(text: str) -> tuple[Optional[str], UnitStatus]:
     return (text.strip(), UnitStatus.AVAILABLE)
 
 
+def parse_special(text: str) -> Special:
+    """Parse a special/promo description into a structured Special object."""
+    text = text.strip()
+    sp = Special(description=text)
+    tl = text.lower()
+
+    # Months free: "1 month free", "1/2 month free", "½ month free", "2 months free"
+    m = re.search(r"(\d+(?:/\d+)?|½)\s*months?\s*free", tl)
+    if m:
+        raw = m.group(1)
+        if raw == "½":
+            sp.discount_amount = 0.5
+        elif "/" in raw:
+            num, den = raw.split("/")
+            sp.discount_amount = float(num) / float(den)
+        else:
+            sp.discount_amount = float(raw)
+
+    # Percentage off: "10% off", "50% off first month"
+    m = re.search(r"(\d+)%\s*off", tl)
+    if m:
+        sp.discount_percent = float(m.group(1))
+
+    # Dollar amount off: "$500 off", "$1,000 off"
+    if sp.discount_amount is None:
+        m = re.search(r"\$\s*([\d,]+)\s*off", tl)
+        if m:
+            sp.discount_amount = float(m.group(1).replace(",", ""))
+
+    # Lease term: "12-month lease", "13 month lease"
+    m = re.search(r"(\d+)\s*-?\s*months?\s*lease", tl)
+    if m:
+        sp.lease_term_months = int(m.group(1))
+
+    # Valid through: "through 3/31", "expires 04/15/2026", "valid until 3/31"
+    m = re.search(r"(?:through|expires?|until|by)\s+(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", tl)
+    if m:
+        sp.valid_through = m.group(1)
+
+    return sp
+
+
 def build_unit_type(beds, baths):
     if beds is None:
         return None
@@ -423,6 +465,12 @@ class PlaywrightScraper:
                     seen_unit_ids.add(uid)
                     all_units.append(u)
 
+        # Propagate community-level specials to units that have none
+        if prop.specials:
+            for u in all_units:
+                if not u.specials:
+                    u.specials = list(prop.specials)
+
         prop.units = all_units
         log.info(f"RESULT: {len(all_units)} units from \"{prop.name}\"")
         return prop
@@ -444,6 +492,7 @@ class PlaywrightScraper:
         generic = {
             "floor plans", "floorplans", "pricing", "availability",
             "apartments", "apartment", "home", "welcome",
+            "available apartments",
         }
         # Split on | and – / — / - delimiters
         parts = [s.strip() for s in raw.replace("–", "|").replace("—", "|").replace(" - ", "|").split("|") if s.strip()]
@@ -494,6 +543,16 @@ class PlaywrightScraper:
             except Exception:
                 pass
 
+        # MAA: data-property-name on the Vue component
+        if prop.name == "Unknown Property" or prop.name.lower() in ("available apartments",):
+            try:
+                maa_el = page.locator("[data-property-name]").first
+                maa_name = maa_el.get_attribute("data-property-name", timeout=2000)
+                if maa_name and len(maa_name) < 80:
+                    prop.name = maa_name.strip()
+            except Exception:
+                pass
+
         # Try to find address
         try:
             addr_el = page.locator(
@@ -509,6 +568,8 @@ class PlaywrightScraper:
         source = page.content()
         url_lower = url.lower()
         for platform, kws in [
+            ("cortland", ["cortland.com"]),
+            ("maa", ["maac.com"]),
             ("sightmap", ["sightmap"]),
             ("rentcafe", ["rentcafe"]),
             ("entrata", ["entrata"]),
@@ -519,14 +580,62 @@ class PlaywrightScraper:
                 prop.platform = platform
                 break
 
-        # Extract specials
+        # Extract specials from banners, popdowns, alerts, and dedicated sections
+        special_keywords = re.compile(
+            r"month[s]?\s*free|free\s*rent|%\s*off|\$\d+\s*off|"
+            r"free\s*(?:app|admin|application|processing)|"
+            r"waive[ds]?\s*(?:fee|admin|application)|"
+            r"reduced\s*(?:fee|rent|deposit)|"
+            r"look\s*(?:and|&)\s*lease|move.in\s*special|concession",
+            re.I,
+        )
+        seen_specials = set()
         try:
-            for sel in [".special", ".promo", ".concession", ".move-in-special",
-                        "[class*='special']", "[class*='promo']"]:
+            for sel in [
+                # Dedicated specials elements
+                ".special", ".promo", ".concession", ".move-in-special",
+                "[class*='special']", "[class*='promo']", "[class*='concession']",
+                # Banner / popdown / alert patterns
+                ".popdown__title-text", ".popdown__content",
+                "[class*='popdown'] [class*='title']",
+                "[class*='banner'] [class*='text']", "[class*='banner'] [class*='title']",
+                ".alert-banner", "[class*='alert-banner']",
+                "[class*='hero'] [class*='special']",
+                "[class*='ribbon']", "[class*='badge'] [class*='special']",
+                # Notification / announcement bars
+                "[class*='announcement']", "[class*='notification-bar']",
+                "[class*='promo-bar']", "[class*='offer-bar']",
+            ]:
                 for el in page.locator(sel).all():
-                    text = el.inner_text().strip()
-                    if len(text) > 5 and len(text) < 500:
-                        prop.specials.append(Special(description=text))
+                    try:
+                        text = el.inner_text(timeout=2000).strip()
+                        if len(text) < 5 or len(text) > 500:
+                            continue
+                        # Normalize whitespace for dedup
+                        norm = " ".join(text.split())
+                        if not special_keywords.search(norm):
+                            continue
+                        # Skip if this text is a substring of (or contains)
+                        # an already-seen special
+                        is_dup = False
+                        for existing in list(seen_specials):
+                            if norm in existing or existing in norm:
+                                is_dup = True
+                                # Keep the shorter (more focused) version
+                                if len(norm) < len(existing):
+                                    seen_specials.discard(existing)
+                                    prop.specials[:] = [
+                                        s for s in prop.specials
+                                        if " ".join(s.description.split()) != existing
+                                    ]
+                                    break
+                                else:
+                                    break
+                        if not is_dup or len(norm) < min((len(e) for e in seen_specials), default=9999):
+                            seen_specials.add(norm)
+                            prop.specials.append(parse_special(text))
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -783,6 +892,12 @@ class PlaywrightScraper:
             return []
 
         soup = BeautifulSoup(html, "lxml")
+
+        # Try Cortland-specific parser first
+        cortland_units = self._parse_cortland(soup)
+        if cortland_units:
+            return cortland_units
+
         units = []
 
         # Find unit cards/rows
@@ -868,7 +983,7 @@ class PlaywrightScraper:
         for sp_el in card.select(".special, .concession, .promo, [class*='special']"):
             sp_text = sp_el.get_text(strip=True)
             if sp_text and len(sp_text) > 3:
-                specials.append(Special(description=sp_text))
+                specials.append(parse_special(sp_text))
 
         # Floor
         floor = None
@@ -900,6 +1015,158 @@ class PlaywrightScraper:
             floor=floor,
             specials=specials,
         )
+
+    # ── Cortland-Specific Parsing ───────────────────────────────────────
+
+    def _parse_cortland(self, soup) -> list[Unit]:
+        """Parse Cortland apartment cards (.apartments__card elements)."""
+        units = []
+        cards = soup.select(".apartments__card")
+        if not cards:
+            return units
+
+        for card in cards:
+            # Unit number from the bold text inside .apartments__card-number
+            unit_num = "N/A"
+            num_el = card.select_one(".apartments__card-number strong")
+            if num_el:
+                unit_num = num_el.get_text(strip=True).lstrip("#")
+
+            # Floor plan name
+            fp_el = card.select_one(".apartments__card-floorplan")
+            fp_name = fp_el.get_text(strip=True) if fp_el else None
+
+            # Price — "Starting at $1,557"
+            rent_min = rent_max = None
+            price_el = card.select_one(".apartments__card-price")
+            if price_el:
+                rent_min, rent_max = parse_rent(price_el.get_text(strip=True))
+
+            # Floor — "Floor 3"
+            floor = None
+            floor_el = card.select_one(".apartments__card-info--location")
+            if floor_el:
+                fl_match = re.search(r"(\d+)", floor_el.get_text(strip=True))
+                if fl_match:
+                    floor = int(fl_match.group(1))
+
+            # Bed / Bath from .apartments__card-info--main
+            beds = baths = None
+            meta_el = card.select_one(".apartments__card-info--main")
+            if meta_el:
+                meta_text = meta_el.get_text(" ", strip=True)
+                beds, baths = parse_beds_baths(meta_text)
+
+            # Sqft from .apartments__card-sqft
+            sqft = None
+            sqft_el = card.select_one(".apartments__card-sqft")
+            if sqft_el:
+                sqft = parse_sqft(sqft_el.get_text(strip=True))
+
+            # Availability — "Available Now" or "Available starting 3/27"
+            avail_date, status = None, UnitStatus.UNKNOWN
+            avail_el = card.select_one(".apartments__card-info--avail")
+            if avail_el:
+                avail_date, status = parse_availability(avail_el.get_text(strip=True))
+
+            units.append(Unit(
+                unit_number=unit_num,
+                floor_plan_name=fp_name,
+                unit_type=build_unit_type(beds, baths),
+                bedrooms=beds,
+                bathrooms=baths,
+                sqft=sqft,
+                rent_min=rent_min,
+                rent_max=rent_max,
+                available_date=avail_date,
+                status=status,
+                floor=floor,
+            ))
+
+        if units:
+            log.info(f"  Parsed {len(units)} units from Cortland HTML")
+        return units
+
+    # ── MAA-Specific Parsing (JSON API) ────────────────────────────────
+
+    def _parse_maa_response(self, body: str) -> list[Unit]:
+        """Parse MAA /api/apartments/search JSON response."""
+        units = []
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return units
+
+        if not isinstance(data, dict):
+            return units
+
+        apartments = data.get("apartments", [])
+        if not isinstance(apartments, list):
+            return units
+
+        for apt in apartments:
+            if not isinstance(apt, dict):
+                continue
+
+            unit_num = str(apt.get("UnitNumber", "N/A")).lstrip("0") or "N/A"
+            fp_name = apt.get("FloorPlanName")
+            beds = apt.get("Beds")
+            baths = apt.get("Baths")
+            if baths is not None:
+                baths = float(baths)
+            sqft = apt.get("SqFt")
+
+            rent_min = apt.get("MinPrice")
+            if rent_min is not None:
+                rent_min = float(rent_min)
+            rent_max = apt.get("MaxPrice")
+            if rent_max is not None:
+                rent_max = float(rent_max)
+
+            # Availability — "01/22/2026" or MS JSON date
+            avail_text = apt.get("FormattedMoveIn", "")
+            avail_date, status = parse_availability(avail_text)
+
+            # Floor — "1st Floor", "2nd Floor", "3rd Floor", "Ground Floor"
+            floor = None
+            floor_str = apt.get("FloorBuilding", "")
+            if floor_str:
+                fl_match = re.search(r"(\d+)", floor_str)
+                if fl_match:
+                    floor = int(fl_match.group(1))
+                elif "ground" in floor_str.lower():
+                    floor = 0
+
+            # Specials
+            specials = []
+            sp_text = apt.get("Specials", "")
+            if sp_text and len(sp_text) > 3:
+                specials.append(parse_special(sp_text))
+
+            # Amenities
+            amenities = apt.get("Amenities", [])
+            if not isinstance(amenities, list):
+                amenities = []
+
+            units.append(Unit(
+                unit_number=unit_num,
+                floor_plan_name=fp_name,
+                unit_type=build_unit_type(beds, baths),
+                bedrooms=beds,
+                bathrooms=baths,
+                sqft=sqft,
+                rent_min=rent_min,
+                rent_max=rent_max,
+                available_date=avail_date,
+                status=status,
+                floor=floor,
+                specials=specials,
+                amenities=amenities,
+            ))
+
+        if units:
+            log.info(f"  Parsed {len(units)} units from MAA API")
+        return units
 
     def _parse_floorplan_sections(self, soup) -> list[Unit]:
         """
@@ -1101,7 +1368,16 @@ class PlaywrightScraper:
         all_units = []
         seen = set()
 
-        # SightMap first (highest fidelity)
+        # MAA first (dedicated parser for /api/apartments/search)
+        for resp in api_responses:
+            if "maac.com" in resp["url"].lower() or "/api/apartments/" in resp["url"].lower():
+                for u in self._parse_maa_response(resp["body"]):
+                    uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
+                    if uid not in seen:
+                        seen.add(uid)
+                        all_units.append(u)
+
+        # SightMap (highest fidelity)
         for resp in api_responses:
             if "sightmap" in resp["url"].lower():
                 for u in self._parse_sightmap_response(resp["body"]):
@@ -1112,7 +1388,10 @@ class PlaywrightScraper:
 
         # Then other API responses
         for resp in api_responses:
-            if "sightmap" not in resp["url"].lower():
+            url_lower = resp["url"].lower()
+            if ("sightmap" not in url_lower
+                    and "maac.com" not in url_lower
+                    and "/api/apartments/" not in url_lower):
                 for u in self._parse_api_response(resp["body"]):
                     uid = f"{u.unit_number}_{u.floor_plan_name}_{u.sqft}"
                     if uid not in seen:
@@ -1299,6 +1578,7 @@ def to_csv(properties: list[Property], path: str):
                 "status": unit.status.value if isinstance(unit.status, UnitStatus) else unit.status,
                 "floor": unit.floor,
                 "specials": "; ".join(s.description for s in unit.specials),
+                "community_specials": "; ".join(s.description for s in prop.specials),
                 "scraped_at": prop.scraped_at,
             })
     if not rows:
