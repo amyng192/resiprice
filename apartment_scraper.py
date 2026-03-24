@@ -311,6 +311,8 @@ class PlaywrightScraper:
         ".unit-result",
         ".available-unit",
         # MAA
+        ".available-apartments__body--apt",
+        ".single-apartment",
         ".floorplan-detail",
         ".floor-plan-item",
         "[class*='floorplan-listing'] [class*='item']",
@@ -639,6 +641,41 @@ class PlaywrightScraper:
         except Exception:
             pass
 
+        # Text-based fallback: scan plain elements for specials keywords
+        # (catches Elementor/WordPress sites that don't use special-related CSS classes)
+        if not seen_specials:
+            try:
+                for el in page.locator("p, div, span, li").all()[:300]:
+                    try:
+                        text = el.inner_text(timeout=1000).strip()
+                        if len(text) < 5 or len(text) > 500:
+                            continue
+                        norm = " ".join(text.split())
+                        if not special_keywords.search(norm):
+                            continue
+                        is_dup = False
+                        for existing in list(seen_specials):
+                            if norm in existing or existing in norm:
+                                is_dup = True
+                                if len(norm) < len(existing):
+                                    seen_specials.discard(existing)
+                                    prop.specials[:] = [
+                                        s for s in prop.specials
+                                        if " ".join(s.description.split()) != existing
+                                    ]
+                                    break
+                                else:
+                                    break
+                        if not is_dup or len(norm) < min(
+                            (len(e) for e in seen_specials), default=9999
+                        ):
+                            seen_specials.add(norm)
+                            prop.specials.append(parse_special(text))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
         return prop
 
     # ── Tab Detection & Clicking ─────────────────────────────────────────
@@ -874,6 +911,7 @@ class PlaywrightScraper:
                 if any(kw in frame_url for kw in [
                     "sightmap", "rentcafe", "realpage", "leasing",
                     "availability", "floorplan", "apartment",
+                    "maac.com", "maa.com",
                 ]):
                     log.info(f"  Found leasing iframe: {frame.url[:80]}")
                     return frame.content()
@@ -893,10 +931,14 @@ class PlaywrightScraper:
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Try Cortland-specific parser first
+        # Try platform-specific parsers first
         cortland_units = self._parse_cortland(soup)
         if cortland_units:
             return cortland_units
+
+        maa_units = self._parse_maa_html(soup)
+        if maa_units:
+            return maa_units
 
         units = []
 
@@ -938,16 +980,16 @@ class PlaywrightScraper:
                 break
         if unit_num == "N/A":
             for sel in [".unit-number", ".apt-number", ".unitNumber",
-                        ".unit-name", ".apt-name", ".unit-id"]:
+                        ".unit-name", ".apt-name", ".unit-id", ".unit"]:
                 el = card.select_one(sel)
                 if el:
-                    unit_num = el.get_text(strip=True)
+                    unit_num = el.get_text(strip=True).lstrip("#")
                     break
 
         # Floor plan
         fp_el = card.select_one(
             ".floor-plan-name, .floorplan-name, .fp-name, "
-            ".plan-name, .planName, h3, h4"
+            ".plan-name, .planName, .floorplan, h3, h4"
         )
         fp_name = fp_el.get_text(strip=True) if fp_el else None
 
@@ -1085,6 +1127,91 @@ class PlaywrightScraper:
 
         if units:
             log.info(f"  Parsed {len(units)} units from Cortland HTML")
+        return units
+
+    # ── MAA-Specific Parsing (HTML) ──────────────────────────────────
+
+    def _parse_maa_html(self, soup) -> list[Unit]:
+        """Parse MAA apartment cards (.available-apartments__body--apt)."""
+        units = []
+        cards = soup.select(".available-apartments__body--apt")
+        if not cards:
+            return units
+
+        for card in cards:
+            # Unit number — <span class="unit">Unit #01318</span>
+            unit_num = "N/A"
+            unit_el = card.select_one(".unit")
+            if unit_el:
+                raw = unit_el.get_text(strip=True)
+                # Strip "Unit #" prefix
+                unit_num = re.sub(r"^Unit\s*#?\s*", "", raw, flags=re.I).lstrip("0") or "N/A"
+
+            # Price — <span class="price">$1863</span>
+            rent_min = rent_max = None
+            price_el = card.select_one(".price")
+            if price_el:
+                rent_min, rent_max = parse_rent(price_el.get_text(strip=True))
+
+            # Details from .apt-details li elements
+            beds = baths = sqft = floor = None
+            avail_date, status = None, UnitStatus.UNKNOWN
+            for li in card.select(".apt-details li"):
+                li_text = li.get_text(strip=True)
+                if "bed" in li_text.lower() or "bath" in li_text.lower():
+                    beds, baths = parse_beds_baths(li_text)
+                elif "sq" in li_text.lower():
+                    sqft = parse_sqft(li_text)
+                elif "floor" in li_text.lower() or "ground" in li_text.lower():
+                    fl_match = re.search(r"(\d+)", li_text)
+                    if fl_match:
+                        floor = int(fl_match.group(1))
+                    elif "ground" in li_text.lower():
+                        floor = 0
+                elif "move" in li_text.lower():
+                    # "Move-in: 03/23 - 03/26" → extract first date
+                    clean = re.sub(r"^move[- ]?in:?\s*", "", li_text, flags=re.I).strip()
+                    # Take first date from a range like "03/23 - 03/26"
+                    date_match = re.search(r"(\d{1,2}/\d{1,2})", clean)
+                    if date_match:
+                        avail_date = date_match.group(1)
+                        status = UnitStatus.AVAILABLE
+                    else:
+                        avail_date, status = parse_availability(clean)
+
+            # Floor plan name from amenities text (e.g., "22B-FP")
+            fp_name = None
+            amen_el = card.select_one(".apt-amenities")
+            if amen_el:
+                fp_match = re.search(r"(\w+)-FP", amen_el.get_text())
+                if fp_match:
+                    fp_name = fp_match.group(1)
+
+            # Specials — .move-in-special
+            specials = []
+            sp_el = card.select_one(".move-in-special")
+            if sp_el:
+                sp_text = sp_el.get_text(" ", strip=True)
+                if sp_text and len(sp_text) > 3:
+                    specials.append(parse_special(sp_text))
+
+            units.append(Unit(
+                unit_number=unit_num,
+                floor_plan_name=fp_name,
+                unit_type=build_unit_type(beds, baths),
+                bedrooms=beds,
+                bathrooms=baths,
+                sqft=sqft,
+                rent_min=rent_min,
+                rent_max=rent_max,
+                available_date=avail_date,
+                status=status,
+                floor=floor,
+                specials=specials,
+            ))
+
+        if units:
+            log.info(f"  Parsed {len(units)} units from MAA HTML")
         return units
 
     # ── MAA-Specific Parsing (JSON API) ────────────────────────────────
