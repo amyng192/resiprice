@@ -327,11 +327,17 @@ class PlaywrightScraper:
         self.headless = headless
         self.timeout_ms = timeout_ms
 
+    def _check_cancel(self, cancel_event):
+        """Raise if cancellation has been requested."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Scrape cancelled by timeout")
+
     def scrape(
         self,
         url: str,
         tab_labels: Optional[list[str]] = None,
         tab_type: str = "auto",
+        cancel_event=None,
     ) -> Property:
         """
         Main entry point.
@@ -342,8 +348,15 @@ class PlaywrightScraper:
                         (e.g., ["0", "1", "2"] for floor tabs).
             tab_type: "floor", "bedroom", "auto". Helps target the right
                       tab selectors if specified.
+            cancel_event: Optional threading.Event — if set, abort early.
         """
         from playwright.sync_api import sync_playwright
+
+        # ── Normalize URLs for sites with separate availability pages ─────
+        url = url.rstrip("/")
+        if "cortland.com/apartments/" in url and not url.endswith("/available-apartments"):
+            url = url + "/available-apartments/"
+            log.info(f"Cortland detected — redirecting to availability page: {url}")
 
         log.info(f"Starting scrape: {url}")
 
@@ -386,6 +399,8 @@ class PlaywrightScraper:
             page.on("response", capture_response)
 
             try:
+                self._check_cancel(cancel_event)
+
                 # ── Load the page ────────────────────────────────────────
                 log.info("Loading page...")
                 try:
@@ -395,11 +410,15 @@ class PlaywrightScraper:
                     page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 page.wait_for_timeout(3000)
 
+                self._check_cancel(cancel_event)
+
                 # ── Dismiss overlays / cookie banners / popups ─────────
                 self._dismiss_overlays(page)
 
                 # ── Extract property-level info ──────────────────────────
                 prop = self._extract_property_info(page, url)
+
+                self._check_cancel(cancel_event)
 
                 # ── Click "Load More" / "View All" buttons ───────────────
                 self._click_load_more(page)
@@ -411,6 +430,8 @@ class PlaywrightScraper:
                     log.info(f"Using explicit tabs: {tab_labels}")
                     html_snapshots = self._click_explicit_tabs(page, tab_labels)
 
+                self._check_cancel(cancel_event)
+
                 if not html_snapshots:
                     tabs = self._detect_tabs(page, tab_type)
                     if tabs:
@@ -421,6 +442,8 @@ class PlaywrightScraper:
 
                 # Always capture current page state too
                 html_snapshots.append(page.content())
+
+                self._check_cancel(cancel_event)
 
                 # ── Scroll to trigger any lazy-loaded content ────────────
                 page.evaluate("""

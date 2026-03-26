@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter
@@ -17,18 +18,33 @@ from apartment_scraper import PlaywrightScraper
 log = logging.getLogger("resiprice.api")
 router = APIRouter(prefix="/api")
 
-# Limit to 1 concurrent browser — parallel Chromium instances thrash
-# CPU/RAM and cause all scrapes to time out on typical hardware.
-# URLs are queued and streamed back one at a time as they complete.
+# Single-worker pool — we run one browser at a time to avoid thrashing.
 executor = ThreadPoolExecutor(max_workers=1)
 
+# Per-URL timeout in seconds.  Each URL gets its own full window.
+PER_URL_TIMEOUT = 240
 
-def scrape_one(url: str) -> dict:
+
+def scrape_one(url: str, cancel_event: threading.Event) -> dict:
+    """Run a single scrape, checking the cancel event periodically."""
     scraper = PlaywrightScraper(headless=True)
-    # Single scrape — try explicit floor tabs first, auto-detect as fallback
-    # (both strategies run inside a single browser session now)
-    result = scraper.scrape(url, tab_labels=["0", "1", "2", "3", "4", "5"], tab_type="floor")
+    result = scraper.scrape(
+        url,
+        tab_labels=["0", "1", "2", "3", "4", "5"],
+        tab_type="floor",
+        cancel_event=cancel_event,
+    )
     return result.to_dict()
+
+
+def scrape_one_safe(url: str, cancel_event: threading.Event) -> dict:
+    """Wrapper that ensures browser cleanup even on cancellation."""
+    try:
+        return scrape_one(url, cancel_event)
+    except Exception:
+        if cancel_event.is_set():
+            raise TimeoutError("Scrape cancelled")
+        raise
 
 
 @router.get("/health")
@@ -41,55 +57,49 @@ async def scrape(request: ScrapeRequest):
     urls = request.urls
     loop = asyncio.get_event_loop()
 
-    # Per-URL timeout — each URL gets its own independent deadline
-    per_url_timeout = 180
-
-    async def scrape_with_timeout(idx: int, url: str) -> tuple[int, dict | None, str | None]:
-        """Run a single scrape with its own timeout. Returns (index, result, error)."""
-        try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(executor, scrape_one, url),
-                timeout=per_url_timeout,
-            )
-            return (idx, result, None)
-        except asyncio.TimeoutError:
-            log.error(f"Scrape timed out for {url}")
-            return (idx, None, "Scrape timed out — this site may be too complex to scrape automatically.")
-        except Exception as e:
-            log.error(f"Scrape failed for {url}: {e}")
-            return (idx, None, str(e))
-
     async def event_generator():
-        tasks = {
-            asyncio.ensure_future(scrape_with_timeout(i, url)): i
-            for i, url in enumerate(urls)
-        }
-
-        while tasks:
-            done, _ = await asyncio.wait(
-                tasks.keys(), return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for task in done:
-                tasks.pop(task)
-                idx, result, error = task.result()
-                if result is not None:
-                    yield {
-                        "event": "property",
-                        "data": json.dumps({
-                            "index": idx,
-                            "property": result,
-                        }),
-                    }
-                else:
-                    yield {
-                        "event": "error",
-                        "data": json.dumps({
-                            "index": idx,
-                            "url": urls[idx],
-                            "error": error,
-                        }),
-                    }
+        # Process URLs sequentially so each one gets the full timeout window.
+        # With max_workers=1, parallel submission would just queue and starve.
+        for idx, url in enumerate(urls):
+            cancel_event = threading.Event()
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor, scrape_one_safe, url, cancel_event
+                    ),
+                    timeout=PER_URL_TIMEOUT,
+                )
+                yield {
+                    "event": "property",
+                    "data": json.dumps({
+                        "index": idx,
+                        "property": result,
+                    }),
+                }
+            except asyncio.TimeoutError:
+                # Signal the thread to stop, so it doesn't block the worker
+                cancel_event.set()
+                log.error(f"Scrape timed out for {url}")
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "index": idx,
+                        "url": url,
+                        "error": "Scrape timed out — the site took too long to respond.",
+                    }),
+                }
+                # Give the thread a moment to notice the cancel and release the worker
+                await asyncio.sleep(2)
+            except Exception as e:
+                log.error(f"Scrape failed for {url}: {e}")
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "index": idx,
+                        "url": url,
+                        "error": str(e),
+                    }),
+                }
 
         yield {"event": "done", "data": json.dumps({"done": True})}
 
