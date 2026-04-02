@@ -15,6 +15,7 @@ export default function App() {
   const [results, setResults] = useState<Property[]>([]);
 
   const handleSubmit = useCallback(async (urls: string[]) => {
+    const token = localStorage.getItem("rp_token");
     setLoading(true);
     setResults([]);
 
@@ -30,7 +31,10 @@ export default function App() {
 
     await fetchEventSource("/api/scrape", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify({ urls }),
       onmessage(ev) {
         if (ev.event === "property") {

@@ -298,12 +298,54 @@ header p {
   color: var(--slate-700);
 }
 
+/* Bedroom Summary */
+.bedroom-summary {
+  background: white;
+  border-radius: var(--radius);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.bedroom-summary-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  color: var(--slate-700);
+}
+
+.bedroom-summary .table-wrapper {
+  box-shadow: none;
+}
+
+.bedroom-summary table {
+  font-size: 0.8rem;
+}
+
+.bedroom-summary th.sub-header {
+  background: var(--slate-500);
+  font-size: 0.7rem;
+  font-weight: 500;
+  padding: 0.35rem 0.6rem;
+}
+
+.bedroom-summary .bed-label {
+  font-weight: 600;
+  color: var(--slate-700);
+}
+
 /* Table Controls */
 .table-controls {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 0.75rem;
+}
+
+.table-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .table-controls label {

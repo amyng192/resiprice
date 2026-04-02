@@ -6,9 +6,10 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+from backend.auth import verify_token
 from backend.schemas import ScrapeRequest
 
 # Ensure the project root is on the path so we can import apartment_scraper
@@ -53,7 +54,15 @@ async def health():
 
 
 @router.post("/scrape")
-async def scrape(request: ScrapeRequest):
+async def scrape(request: ScrapeRequest, raw_request: Request):
+    # Require valid auth token
+    auth = raw_request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_token(auth[7:])
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
     urls = request.urls
     loop = asyncio.get_event_loop()
 
@@ -97,7 +106,7 @@ async def scrape(request: ScrapeRequest):
                     "data": json.dumps({
                         "index": idx,
                         "url": url,
-                        "error": str(e),
+                        "error": "Scrape failed — an unexpected error occurred.",
                     }),
                 }
 
