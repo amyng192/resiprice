@@ -12,5 +12,8 @@ rosemont_units.csv
 node_modules/
 frontend/dist/
 
+# Database
+data/
+
 # Environment
 .env

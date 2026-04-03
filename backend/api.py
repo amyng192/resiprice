@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from backend.auth import verify_token
+from backend.database import upsert_community
 from backend.schemas import ScrapeRequest
 
 # Ensure the project root is on the path so we can import apartment_scraper
@@ -85,6 +86,15 @@ async def scrape(request: ScrapeRequest, raw_request: Request):
                         "property": result,
                     }),
                 }
+                # Auto-save community to database
+                try:
+                    upsert_community(
+                        name=result.get("name", ""),
+                        url=url,
+                        platform=result.get("platform"),
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to save community to DB: {e}")
             except asyncio.TimeoutError:
                 # Signal the thread to stop, so it doesn't block the worker
                 cancel_event.set()

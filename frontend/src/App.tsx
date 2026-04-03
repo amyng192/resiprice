@@ -8,7 +8,7 @@ import LoadingState from "./components/LoadingState";
 import ComparisonTable from "./components/ComparisonTable";
 
 export default function App() {
-  const { user, logout } = useAuth();
+  const { user, token, logout } = useAuth();
   const navigate = useNavigate();
   const [slots, setSlots] = useState<PropertySlot[]>([]);
   const [loading, setLoading] = useState(false);
@@ -92,7 +92,7 @@ export default function App() {
       </header>
 
       <main>
-        <UrlForm onSubmit={handleSubmit} loading={loading} />
+        <UrlForm onSubmit={handleSubmit} loading={loading} token={token} />
 
         {slots.length > 0 && <LoadingState slots={slots} />}
 

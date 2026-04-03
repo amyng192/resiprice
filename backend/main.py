@@ -7,6 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api import router as api_router
 from backend.auth import router as auth_router
+from backend.communities import router as communities_router
+from backend.database import init_db
+
+init_db()
 
 app = FastAPI(title="ResiPrice", version="1.0.0")
 
@@ -19,6 +23,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(api_router)
+app.include_router(communities_router)
 
 # Serve React build if it exists
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"

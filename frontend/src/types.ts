@@ -23,6 +23,13 @@ export interface Property {
   specials: { description: string }[];
 }
 
+export interface Community {
+  id: number;
+  name: string;
+  url: string;
+  platform: string | null;
+}
+
 export type ScrapeStatus = "idle" | "scraping" | "done" | "error";
 
 export interface PropertySlot {
