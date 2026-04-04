@@ -7,6 +7,8 @@ venv/
 # Output files
 rosemont_results.json
 rosemont_units.csv
+pipeline_progress.jsonl
+qualifying_communities*.csv
 
 # Node
 node_modules/
