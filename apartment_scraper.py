@@ -361,7 +361,10 @@ class PlaywrightScraper:
         log.info(f"Starting scrape: {url}")
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=self.headless)
+            browser = pw.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -371,6 +374,13 @@ class PlaywrightScraper:
                 viewport={"width": 1920, "height": 1080},
             )
             page = context.new_page()
+
+            # Apply stealth to bypass Cloudflare Turnstile and similar bot detection
+            try:
+                from playwright_stealth import Stealth
+                Stealth().apply_stealth_sync(page)
+            except ImportError:
+                log.warning("playwright-stealth not installed — bot detection may block some sites")
 
             # ── Capture XHR responses that might contain unit JSON ────────
             api_responses = []
@@ -403,12 +413,24 @@ class PlaywrightScraper:
 
                 # ── Load the page ────────────────────────────────────────
                 log.info("Loading page...")
+                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+
+                # ── Wait for Cloudflare / bot-challenge pages to resolve ──
+                for _cf_wait in range(12):
+                    title = (page.title() or "").lower()
+                    if "just a moment" not in title and "security check" not in title:
+                        break
+                    log.info("Cloudflare challenge detected — waiting for resolution...")
+                    page.wait_for_timeout(5000)
+                else:
+                    log.warning("Cloudflare challenge did not resolve after 60s")
+
+                # Give dynamic content time to render
                 try:
-                    page.goto(url, wait_until="networkidle", timeout=self.timeout_ms)
+                    page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
-                    log.warning("networkidle timed out — retrying with domcontentloaded")
-                    page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                page.wait_for_timeout(3000)
+                    pass
+                page.wait_for_timeout(2000)
 
                 self._check_cancel(cancel_event)
 
@@ -883,6 +905,11 @@ class PlaywrightScraper:
             "[class*='hours'] [class*='close']",
             # Property hours overlay (Cortland)
             ".property-hours__overlay",
+            # Nudge / lead-capture modals
+            "[class*='nudge'] [class*='close']",
+            "#customNudge [class*='close']",
+            ".nudgemodal [class*='close']",
+            "#customNudge .close",
         ]
         for sel in dismiss_selectors:
             try:
@@ -896,9 +923,8 @@ class PlaywrightScraper:
         # Also try to remove blocking overlays via JS if they can't be clicked
         page.evaluate("""
             () => {
-                for (const sel of ['.property-hours', '#onetrust-consent-sdk', '[class*="overlay"]']) {
-                    const el = document.querySelector(sel);
-                    if (el) el.style.display = 'none';
+                for (const sel of ['.property-hours', '#onetrust-consent-sdk', '[class*="overlay"]', '.nudgemodal', '#customNudge', '.modal.show', '.modal-backdrop']) {
+                    document.querySelectorAll(sel).forEach(el => el.remove());
                 }
             }
         """)
