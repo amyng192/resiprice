@@ -45,7 +45,7 @@ RESULTS_PATH = ROOT / "bulk_scrape_results.jsonl"
 QUALIFIED_CSV = ROOT / "bulk_scrape_qualified.csv"
 FAILED_CSV = ROOT / "bulk_scrape_failed.csv"
 
-PER_SCRAPE_TIMEOUT_S = 90  # hard ceiling per community
+SCRAPER_TIMEOUT_MS = 20000  # per-action timeout inside the scraper
 FILE_LOCK = threading.Lock()
 
 
@@ -73,8 +73,8 @@ def append_result(record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def scrape_one(scraper: PlaywrightScraper, community: dict) -> dict:
-    """Scrape one community and return a result record."""
+def worker(community: dict) -> dict:
+    """Scrape one community in its own thread with its own scraper instance."""
     name = community["name"]
     url = community["url"]
     started = time.time()
@@ -91,24 +91,13 @@ def scrape_one(scraper: PlaywrightScraper, community: dict) -> dict:
         "elapsed_s": 0.0,
         "scraped_at": datetime.utcnow().isoformat(),
     }
-    cancel_event = threading.Event()
-
-    def run():
-        return scraper.scrape(
+    scraper = PlaywrightScraper(headless=True, timeout_ms=SCRAPER_TIMEOUT_MS)
+    try:
+        prop = scraper.scrape(
             url,
             tab_labels=["0", "1", "2", "3", "4", "5"],
             tab_type="floor",
-            cancel_event=cancel_event,
         )
-
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(run)
-            try:
-                prop = future.result(timeout=PER_SCRAPE_TIMEOUT_S)
-            except Exception:
-                cancel_event.set()
-                raise
         units = len(prop.units)
         priced = sum(1 for u in prop.units if u.rent_min and u.rent_min > 0)
         record["units"] = units
@@ -123,29 +112,8 @@ def scrape_one(scraper: PlaywrightScraper, community: dict) -> dict:
     except Exception as e:
         record["error"] = str(e)[:300]
         record["status"] = "error"
-
     record["elapsed_s"] = round(time.time() - started, 1)
     return record
-
-
-def worker(community: dict) -> dict:
-    # Each worker gets its own scraper (isolated playwright context)
-    scraper = PlaywrightScraper(headless=True, timeout_ms=30000)
-    try:
-        return scrape_one(scraper, community)
-    except Exception as e:
-        return {
-            "id": community["id"],
-            "name": community["name"],
-            "url": community["url"],
-            "platform_hint": community.get("platform") or "",
-            "status": "error",
-            "units": 0,
-            "priced": 0,
-            "error": f"worker crash: {str(e)[:250]}",
-            "elapsed_s": 0.0,
-            "scraped_at": datetime.utcnow().isoformat(),
-        }
 
 
 def load_pending(limit: int = 0) -> list[dict]:
@@ -240,7 +208,7 @@ def main() -> None:
         return
 
     log.info(f"Starting bulk scrape: {total} communities, {args.workers} workers, "
-             f"{PER_SCRAPE_TIMEOUT_S}s timeout each")
+             f"{SCRAPER_TIMEOUT_MS}ms per-action timeout")
 
     counters = {"qualified": 0, "no_pricing": 0, "no_units": 0, "error": 0}
     start = time.time()
