@@ -24,7 +24,14 @@ PROGRESS = ROOT / "pipeline_progress.jsonl"
 QUALIFYING = ROOT / "qualifying_communities.csv"
 FAILED = ROOT / "qualifying_communities_failed.csv"
 
-REMEDIATION_NOTE_PREFIXES = ("Remediated", "AMLI remediation")
+REMEDIATION_NOTE_PREFIXES = (
+    "Remediated",
+    "AMLI remediation",
+    "Cortland remediation",
+    "Windsor remediation",
+    "Greystar brand remediation",
+    "Bell/Abbey remediation",
+)
 
 
 def main() -> None:
