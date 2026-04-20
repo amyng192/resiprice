@@ -1501,7 +1501,12 @@ class PlaywrightScraper:
 
         sqft_raw = get("SquareFeet", "sqft", "squareFeet", "MaximumSquareFeet",
                         "MinimumSquareFeet", "area", "SqFt", "SQFT",
-                        "square_feet", "squareFt", "size", "maxSqft", "minSqft")
+                        "square_feet", "squareFt", "size", "maxSqft", "minSqft",
+                        "sqftDisplay")
+        # sqftDisplay may be a non-numeric string like "850 - 900" — take first number
+        if sqft_raw and not str(sqft_raw).replace(",", "").replace(".", "").isdigit():
+            m = re.search(r"\d+", str(sqft_raw))
+            sqft_raw = m.group() if m else None
         sqft = int(float(str(sqft_raw).replace(",", ""))) if sqft_raw else None
 
         rent_raw = get("MinimumRent", "Rent", "rent", "price", "MonthlyRent",
@@ -1513,6 +1518,37 @@ class PlaywrightScraper:
         rent_max_raw = get("MaximumRent", "maximumRent", "maxRent", "MaxRent",
                             "max_price", "maxPrice")
         rent_max = float(str(rent_max_raw).replace(",", "").replace("$", "")) if rent_max_raw else rent_min
+
+        # G5 Marketing Cloud (inventory.g5marketingcloud.com/graphql) nests
+        # pricing as prices=[{priceType:"min_rent", formattedPrice:"$X,XXX"}].
+        # Same shape appears on a few other white-label g5 deployments.
+        if rent_min is None:
+            prices_arr = item.get("prices")
+            if isinstance(prices_arr, list):
+                min_p = max_p = None
+                for p in prices_arr:
+                    if not isinstance(p, dict):
+                        continue
+                    ptype = p.get("priceType") or p.get("type") or ""
+                    raw = p.get("formattedPrice") or p.get("amount") or p.get("price")
+                    if raw is None:
+                        continue
+                    m = re.search(r"[\d,]+(?:\.\d+)?", str(raw))
+                    if not m:
+                        continue
+                    try:
+                        val = float(m.group().replace(",", ""))
+                    except ValueError:
+                        continue
+                    if "min" in ptype.lower():
+                        min_p = val
+                    elif "max" in ptype.lower():
+                        max_p = val
+                    elif min_p is None:
+                        min_p = val
+                if min_p is not None:
+                    rent_min = min_p
+                    rent_max = max_p if max_p is not None else min_p
 
         avail_raw = str(get("AvailableDate", "availableDate", "MoveInDate",
                              "available_date", "DateAvailable", "moveInDate",
