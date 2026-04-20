@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-apply_remediations_to_csv.py — Surgically update qualifying_communities.csv
-and qualifying_communities_failed.csv with the 11 remediated rows, without
-clobbering the manual curation that already exists in the CSVs.
+apply_remediations_to_csv.py — Surgically patch qualifying_communities.csv
+and qualifying_communities_failed.csv using the *latest* records in
+pipeline_progress.jsonl.
 
-Source of truth for the remediated URLs: pipeline_progress.jsonl (last record
-per key wins, so the entries appended by fix_failed_urls.py are authoritative
-for these 11 properties).
+By default this pulls all JSONL records whose notes start with the remediation
+marker (currently "Remediated" or "AMLI remediation") and applies them. This
+avoids clobbering hundreds of manually-curated rows — we never re-export the
+whole CSV from the JSONL, only patch the rows we know we touched.
 
-Why this exists: pipeline_atlanta.export_csv() rebuilds the qualifying CSV
-from the JSONL, but the JSONL has drifted from the curated CSV (many rows are
-'no_pricing' in JSONL yet manually present in qualifying.csv). Overwriting the
-CSV would wipe hundreds of manual entries.
+Invoke without args to auto-patch from the JSONL. Pass --names NAME1,NAME2
+to limit to specific community names.
 """
 
+import argparse
 import csv
 from pathlib import Path
 
@@ -24,35 +24,31 @@ PROGRESS = ROOT / "pipeline_progress.jsonl"
 QUALIFYING = ROOT / "qualifying_communities.csv"
 FAILED = ROOT / "qualifying_communities_failed.csv"
 
-REMEDIATED_KEYS = [
-    ("1105 Town Brookhaven", "1105 Town Blvd"),
-    ("Avana Cheshire Bridge", "2124 Cheshire Bridge Road NE"),
-    ("Avana City North", "3421 Northlake Pkwy NE"),
-    ("Avana Cityview", "1650 Barnes Mill Road"),
-    ("Avana on Main", "508 Main Street NE"),
-    ("Avana Portico", "2110 Preston Park Drive"),
-    ("Avana Twenty9", "2334 Fuller Way"),
-    ("Avana Acworth", "4710 Baker Grove Road NW"),
-    ("Avana Dunwoody", "10 Gentrys Walk"),
-    ("Avana Kennesaw", "3840 Jiles Road"),
-    ("Avana TownPark", "3725 George Busbee Pkwy NW"),
-]
+REMEDIATION_NOTE_PREFIXES = ("Remediated", "AMLI remediation")
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--names", default="", help="Comma-separated subset of names to patch")
+    args = ap.parse_args()
+
     progress = load_progress(str(PROGRESS))
 
-    # Build {name: (url, platform)} from the latest JSONL records
+    name_filter = {n.strip() for n in args.names.split(",") if n.strip()} if args.names else None
+
+    # Build {name: (url, platform)} from the latest remediation JSONL records
     remediated: dict[str, tuple[str, str]] = {}
-    for name, addr in REMEDIATED_KEYS:
-        key = f"{name}|{addr}"
-        rec = progress.get(key)
-        if not rec:
-            print(f"WARN: {key} not in progress")
+    for rec in progress.values():
+        notes = rec.get("notes", "") or ""
+        if not any(notes.startswith(p) for p in REMEDIATION_NOTE_PREFIXES):
+            continue
+        name = rec.get("property_name")
+        if name_filter and name not in name_filter:
             continue
         url = rec.get("availability_url") or rec.get("website_url", "")
         platform = rec.get("platform") or ""
-        remediated[name] = (url, platform)
+        if name and url:
+            remediated[name] = (url, platform)
 
     # --- Update qualifying_communities.csv -----------------------------------
     with open(QUALIFYING, "r", encoding="utf-8", newline="") as f:
