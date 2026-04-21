@@ -31,6 +31,7 @@ REMEDIATION_NOTE_PREFIXES = (
     "Windsor remediation",
     "Greystar brand remediation",
     "Bell/Abbey remediation",
+    "G5 URL remediation",
 )
 
 
